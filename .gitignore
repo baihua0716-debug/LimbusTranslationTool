@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+
+# Local game/language samples are not part of the source release.
+Lang/
+
+# User state and generated backups.
+user_data/
+release/user_data/
+
+# Build outputs.
+build/
+dist/
+release/
+*.spec
+
+# Local editor/system noise.
+.DS_Store
+Thumbs.db

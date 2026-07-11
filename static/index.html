@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>零协汉化修正工具</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <h1>零协汉化修正工具</h1>
+          <p id="statusLine">未绑定</p>
+        </div>
+        <div class="bindbar">
+          <input id="bindPath" type="text" spellcheck="false" placeholder="Lang\\LLC_zh-CN 文件夹路径" />
+          <button id="pickFolderButton">选择文件夹</button>
+          <button id="bindButton" class="primary">绑定</button>
+          <button id="reindexButton">刷新索引</button>
+          <button id="shutdownButton">退出</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="filters panel">
+          <div class="control">
+            <label for="queryInput">搜索文本</label>
+            <input id="queryInput" type="search" placeholder="输入译文、文件名、ID" />
+          </div>
+          <div class="control">
+            <label for="categorySelect">分类</label>
+            <select id="categorySelect"></select>
+          </div>
+          <div class="control">
+            <label for="sinnerSelect">罪人</label>
+            <select id="sinnerSelect"></select>
+          </div>
+          <div class="control">
+            <label for="fileInput">文件筛选</label>
+            <input id="fileInput" type="search" placeholder="StoryData / Skills" />
+          </div>
+          <div class="control">
+            <label for="fieldInput">字段筛选</label>
+            <input id="fieldInput" type="search" placeholder="name / desc / content" />
+          </div>
+          <label class="checkline">
+            <input id="modifiedOnly" type="checkbox" />
+            <span>只看已修正</span>
+          </label>
+          <div class="bulk-panel">
+            <div class="bulk-title">批量替换</div>
+            <div class="control compact">
+              <label for="bulkOldInput">原词</label>
+              <input id="bulkOldInput" type="text" placeholder="例：人格" />
+            </div>
+            <div class="control compact">
+              <label for="bulkNewInput">新译名</label>
+              <input id="bulkNewInput" type="text" placeholder="替换为" />
+            </div>
+            <label class="checkline tight">
+              <input id="bulkUseScope" type="checkbox" checked />
+              <span>使用当前筛选范围</span>
+            </label>
+            <label class="checkline tight">
+              <input id="bulkMatchCase" type="checkbox" />
+              <span>区分大小写</span>
+            </label>
+            <div class="bulk-buttons">
+              <button id="bulkPreviewButton">预览</button>
+              <button id="bulkApplyButton" class="primary" disabled>执行</button>
+            </div>
+            <div id="bulkSummary" class="bulk-summary">先预览将会影响的文本。</div>
+            <div id="bulkExamples" class="bulk-examples"></div>
+          </div>
+          <div class="actions">
+            <button id="undoLastButton">撤销最近修改</button>
+            <button id="backupButton">备份当前目录</button>
+            <button id="reapplyButton">重放历史修改</button>
+            <button id="exportButton">导出修正</button>
+          </div>
+        </aside>
+
+        <section class="results panel">
+          <div class="section-head">
+            <h2>检索结果</h2>
+            <span id="resultCount">0</span>
+          </div>
+          <div id="resultList" class="result-list"></div>
+        </section>
+
+        <section class="editor panel">
+          <div class="section-head">
+            <h2>编辑</h2>
+            <span id="selectionTag">未选择</span>
+          </div>
+          <div id="emptyEditor" class="empty-state">选择一条文本后编辑。</div>
+          <div id="editorBody" class="editor-body hidden">
+            <div class="meta-grid">
+              <div>
+                <span>文件</span>
+                <strong id="metaFile"></strong>
+              </div>
+              <div>
+                <span>字段</span>
+                <strong id="metaField"></strong>
+              </div>
+              <div>
+                <span>分类</span>
+                <strong id="metaCategory"></strong>
+              </div>
+              <div>
+                <span>JSON 路径</span>
+                <strong id="metaPath"></strong>
+              </div>
+            </div>
+            <textarea id="editText" spellcheck="false"></textarea>
+            <input id="noteInput" type="text" placeholder="备注" />
+            <div class="savebar">
+              <button id="saveButton" class="primary">保存修改</button>
+              <button id="resetButton">还原到选中值</button>
+            </div>
+          </div>
+
+          <div class="history-head">
+            <h2>历史</h2>
+            <button id="refreshHistoryButton">刷新</button>
+          </div>
+          <div id="historyList" class="history-list"></div>
+        </section>
+      </main>
+    </div>
+    <div id="toast" class="toast hidden"></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
