@@ -299,6 +299,7 @@ INTERNAL_FIELD_HINTS = (
     "file",
 )
 IDENTIFIER_VALUE_RE = re.compile(r"^[A-Za-z0-9_.:/\\#@+\-]+$")
+REFERENCE_TOKEN_RE = re.compile(r"\[([A-Za-z][A-Za-z0-9_.:/\\#@+\-]{1,120})\]")
 
 
 def normalise_field_name(value) -> str:
@@ -336,6 +337,44 @@ def is_default_placeholder_field(path: list, value: str) -> bool:
         return True
     field = normalise_field_name(path[-1]) if path else ""
     return field == "undefined" and text in {"", "-"}
+
+
+def walk_dicts(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for value in obj.values():
+            yield from walk_dicts(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from walk_dicts(value)
+
+
+def collect_keyword_aliases(data, category: str) -> dict[str, set[str]]:
+    aliases: dict[str, set[str]] = {}
+    if category != "keyword":
+        return aliases
+    for item in walk_dicts(data):
+        entry_id = item.get("id")
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            continue
+        for key in ("name", "title", "summary"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip() and not is_default_placeholder_field([key], value):
+                aliases.setdefault(entry_id, set()).add(value.strip())
+    return aliases
+
+
+def referenced_aliases(value: str, keyword_aliases: dict[str, set[str]]) -> list[str]:
+    if not keyword_aliases:
+        return []
+    aliases = []
+    seen = set()
+    for token in REFERENCE_TOKEN_RE.findall(value):
+        for alias in keyword_aliases.get(token, ()):
+            if alias not in seen:
+                aliases.append(alias)
+                seen.add(alias)
+    return aliases
 
 
 def walk_strings(obj, path=None, ancestors=None):
@@ -744,6 +783,8 @@ class AppState:
         errors = []
         json_files = sorted(item for item in root.rglob("*.json") if item.is_file())
         overrides = load_json_sidecar(OVERRIDES_FILE, {})
+        documents = []
+        keyword_aliases: dict[str, set[str]] = {}
         for file_path in json_files:
             rel = posix_rel(file_path, root)
             try:
@@ -753,6 +794,11 @@ class AppState:
                 continue
 
             category = infer_category(rel)
+            documents.append((rel, data, encoding, category))
+            for key, values in collect_keyword_aliases(data, category).items():
+                keyword_aliases.setdefault(key, set()).update(values)
+
+        for rel, data, encoding, category in documents:
             for json_path, value, ancestors in walk_strings(data):
                 if is_internal_string_field(json_path, value):
                     continue
@@ -769,10 +815,11 @@ class AppState:
                 category_label = CATEGORY_LABELS.get(category, category)
                 sinner_label = SINNER_BY_ID.get(sinner or "", {}).get("label", "")
                 label = extract_label(ancestors, leaf_key, value)
+                alias_terms = referenced_aliases(value, keyword_aliases)
                 file_search, file_search_compact = make_search_blob([rel])
                 field_search, field_search_compact = make_search_blob([field, path_display])
                 full_search, full_search_compact = make_search_blob(
-                    [value, label, rel, field, entry_id, path_display, category_label, sinner_label]
+                    [value, label, rel, field, entry_id, path_display, category_label, sinner_label, *alias_terms]
                 )
                 record = {
                     "key": key,
