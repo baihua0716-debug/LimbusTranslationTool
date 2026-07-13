@@ -330,6 +330,14 @@ def is_internal_string_field(path: list, value: str) -> bool:
     return False
 
 
+def is_default_placeholder_field(path: list, value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return True
+    field = normalise_field_name(path[-1]) if path else ""
+    return field == "undefined" and text in {"", "-"}
+
+
 def walk_strings(obj, path=None, ancestors=None):
     path = [] if path is None else path
     ancestors = [] if ancestors is None else ancestors
@@ -587,19 +595,24 @@ def code_from_numeric_id(entry_id) -> str | None:
     return None
 
 
+def code_from_alias_text(*values) -> str | None:
+    compact_text = "".join(re.sub(r"[^a-z0-9]", "", str(value).casefold()) for value in values if value is not None)
+    if not compact_text:
+        return None
+    for alias, code in SINNER_ALIASES.items():
+        compact_alias = re.sub(r"[^a-z0-9]", "", alias)
+        if compact_alias and compact_alias in compact_text:
+            return code
+    return None
+
+
 def infer_sinner(rel: str, entry_id) -> str | None:
     rel_lower = rel.lower().replace("\\", "/")
     match = re.search(r"(?:skills_ego_personality|skills_personality)-(\d{2})", rel_lower)
     if match and match.group(1) in SINNER_BY_ID:
         return match.group(1)
 
-    compact_rel = re.sub(r"[^a-z0-9]", "", rel_lower)
-    for alias, code in SINNER_ALIASES.items():
-        compact_alias = re.sub(r"[^a-z0-9]", "", alias)
-        if compact_alias and compact_alias in compact_rel:
-            return code
-
-    return code_from_numeric_id(entry_id)
+    return code_from_alias_text(rel_lower, entry_id) or code_from_numeric_id(entry_id)
 
 
 def extract_entry_id(ancestors: list[dict]):
@@ -743,10 +756,14 @@ class AppState:
             for json_path, value, ancestors in walk_strings(data):
                 if is_internal_string_field(json_path, value):
                     continue
+                pointer = path_to_pointer(json_path)
+                key = f"{rel}|{pointer}"
+                has_override = key in overrides
+                if not has_override and is_default_placeholder_field(json_path, value):
+                    continue
                 leaf_key = json_path[-1] if json_path else ""
                 entry_id = extract_entry_id(ancestors)
                 sinner = infer_sinner(rel, entry_id)
-                pointer = path_to_pointer(json_path)
                 path_display = path_to_display(json_path)
                 field = str(leaf_key)
                 category_label = CATEGORY_LABELS.get(category, category)
@@ -757,7 +774,6 @@ class AppState:
                 full_search, full_search_compact = make_search_blob(
                     [value, label, rel, field, entry_id, path_display, category_label, sinner_label]
                 )
-                key = f"{rel}|{pointer}"
                 record = {
                     "key": key,
                     "file": rel,
@@ -775,7 +791,7 @@ class AppState:
                     "entryId": entry_id,
                     "label": label,
                     "encoding": encoding,
-                    "hasOverride": key in overrides,
+                    "hasOverride": has_override,
                     "_fileSearch": file_search,
                     "_fileSearchCompact": file_search_compact,
                     "_fieldSearch": field_search,
