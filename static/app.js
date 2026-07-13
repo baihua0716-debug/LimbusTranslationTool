@@ -230,15 +230,26 @@ function resetFilters() {
 async function saveSelected(forceSafety = false) {
   if (!state.selected) return;
   try {
-    const data = await post("/api/update", {
-      file: state.selected.file,
-      path: state.selected.path,
-      newValue: $("editText").value,
-      note: $("noteInput").value,
-      entryId: state.selected.entryId,
-      label: state.selected.label,
-      forceSafety,
-    });
+    const linkedReference = state.selected.linkedReference;
+    const endpoint = linkedReference ? "/api/update-reference" : "/api/update";
+    const payload = linkedReference
+      ? {
+          token: linkedReference.token,
+          expectedValue: linkedReference.expectedValue,
+          newValue: $("editText").value,
+          note: $("noteInput").value,
+          forceSafety,
+        }
+      : {
+          file: state.selected.file,
+          path: state.selected.path,
+          newValue: $("editText").value,
+          note: $("noteInput").value,
+          entryId: state.selected.entryId,
+          label: state.selected.label,
+          forceSafety,
+        };
+    const data = await post(endpoint, payload);
     if (data.blockedBySafety) {
       if (confirmSafetyOverride(data.warnings || [], "这次保存可能破坏游戏文本的格式标记。")) {
         await saveSelected(true);
@@ -248,8 +259,13 @@ async function saveSelected(forceSafety = false) {
       return;
     }
     if (data.changed) {
-      showToast("已保存，原文件已备份。");
+      showToast(
+        linkedReference
+          ? `已同步修改 ${data.fields || linkedReference.copies} 个关联词条，原文件已备份。`
+          : "已保存，原文件已备份。",
+      );
       state.selected.value = $("editText").value;
+      if (linkedReference) linkedReference.expectedValue = $("editText").value;
       await Promise.all([runSearch(), loadHistory()]);
     } else {
       showToast(data.message || "文本没有变化。");

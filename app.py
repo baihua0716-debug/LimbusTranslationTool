@@ -821,6 +821,9 @@ class AppState:
                 full_search, full_search_compact = make_search_blob(
                     [value, label, rel, field, entry_id, path_display, category_label, sinner_label, *alias_terms]
                 )
+                direct_search, direct_search_compact = make_search_blob(
+                    [value, label, rel, field, entry_id, path_display, category_label, sinner_label]
+                )
                 record = {
                     "key": key,
                     "file": rel,
@@ -843,10 +846,41 @@ class AppState:
                     "_fileSearchCompact": file_search_compact,
                     "_fieldSearch": field_search,
                     "_fieldSearchCompact": field_search_compact,
+                    "_directSearch": direct_search,
+                    "_directSearchCompact": direct_search_compact,
                     "_search": full_search,
                     "_searchCompact": full_search_compact,
                 }
                 records.append(record)
+
+        keyword_targets: dict[str, list[dict]] = {}
+        for record in records:
+            if (
+                record["category"] == "keyword"
+                and normalise_field_name(record["field"]) in {"name", "title"}
+                and isinstance(record.get("entryId"), str)
+            ):
+                keyword_targets.setdefault(record["entryId"], []).append(record)
+
+        for record in records:
+            references = []
+            seen_tokens = set()
+            for token in REFERENCE_TOKEN_RE.findall(record["value"]):
+                if token in seen_tokens or token not in keyword_targets:
+                    continue
+                seen_tokens.add(token)
+                aliases = sorted(keyword_aliases.get(token, ()))
+                alias_search, alias_search_compact = make_search_blob(aliases)
+                references.append(
+                    {
+                        "token": token,
+                        "aliases": aliases,
+                        "_search": alias_search,
+                        "_searchCompact": alias_search_compact,
+                        "targets": keyword_targets[token],
+                    }
+                )
+            record["_aliasReferences"] = references
 
         category_counts = {}
         sinner_counts = {}
@@ -901,7 +935,28 @@ class AppState:
         field_prepared = prepare_search_query(field_query)
 
         matches = []
+        seen_keys = set()
         total = 0
+
+        def add_match(key: str, item: dict) -> None:
+            nonlocal total
+            if key in seen_keys:
+                return
+            seen_keys.add(key)
+            total += 1
+            if len(matches) < limit:
+                matches.append(item)
+
+        def add_record(record: dict) -> None:
+            nonlocal total
+            key = record["key"]
+            if key in seen_keys:
+                return
+            seen_keys.add(key)
+            total += 1
+            if len(matches) < limit:
+                matches.append(public_record(record))
+
         for record in self.index:
             if category != "all" and record["category"] != category:
                 continue
@@ -917,16 +972,59 @@ class AppState:
                 field_prepared, record["_fieldSearch"], record["_fieldSearchCompact"]
             ):
                 continue
-            if query and not search_matches_prepared(query_prepared, record["_search"], record["_searchCompact"]):
+            if not query:
+                add_record(record)
                 continue
-            total += 1
-            if len(matches) < limit:
-                matches.append(public_record(record))
+
+            if search_matches_prepared(query_prepared, record["_directSearch"], record["_directSearchCompact"]):
+                add_record(record)
+                continue
+
+            if not search_matches_prepared(query_prepared, record["_search"], record["_searchCompact"]):
+                continue
+
+            # A localized keyword can be referenced by an internal token inside a
+            # passive or skill. Surface the actual localized name as the editing
+            # target, while keeping the source category/sinner filters meaningful.
+            for reference in record.get("_aliasReferences", []):
+                if not search_matches_prepared(
+                    query_prepared, reference["_search"], reference["_searchCompact"]
+                ):
+                    continue
+                targets_by_value: dict[str, list[dict]] = {}
+                for target in reference["targets"]:
+                    targets_by_value.setdefault(target["value"], []).append(target)
+                for value, targets in targets_by_value.items():
+                    first = targets[0]
+                    linked_key = "linked|{}|{}|{}|{}".format(
+                        record["category"], record.get("sinner") or "", reference["token"], sha1_text(value)
+                    )
+                    files = list(dict.fromkeys(target["file"] for target in targets))
+                    linked = {
+                        **public_record(first),
+                        "key": linked_key,
+                        "file": " + ".join(files),
+                        "pathDisplay": f"同步到 {len(targets)} 个关联位置",
+                        "value": value,
+                        "preview": clean_preview(value),
+                        "label": value,
+                        "category": record["category"],
+                        "categoryLabel": f"{record['categoryLabel']}关联词条",
+                        "sinner": record.get("sinner"),
+                        "sinnerLabel": record.get("sinnerLabel", ""),
+                        "hasOverride": any(target.get("hasOverride") for target in targets),
+                        "linkedReference": {
+                            "token": reference["token"],
+                            "expectedValue": value,
+                            "copies": len(targets),
+                        },
+                    }
+                    add_match(linked_key, linked)
 
         return {
             "results": matches,
             "total": total,
-            "limited": total > len(matches),
+            "limited": total > limit,
             "stats": self.stats,
         }
 
@@ -1364,6 +1462,136 @@ class AppState:
 
         return {"changed": True, "backupPath": backup_path}
 
+    def update_reference(self, payload: dict) -> dict:
+        token = str(payload.get("token", "")).strip()
+        expected_value = str(payload.get("expectedValue", ""))
+        new_value = str(payload.get("newValue", ""))
+        note = str(payload.get("note", "")).strip()
+        force_safety = bool(payload.get("forceSafety", False))
+        if not token:
+            raise UserFacingError("缺少关联词条 ID。")
+        if expected_value == new_value:
+            return {"changed": False, "message": "文本没有变化。"}
+
+        with self.lock:
+            self.ensure_index()
+            targets = [
+                record
+                for record in self.index
+                if record["category"] == "keyword"
+                and record.get("entryId") == token
+                and normalise_field_name(record["field"]) in {"name", "title"}
+                and record["value"] == expected_value
+            ]
+            if not targets:
+                raise UserFacingError("关联词条已变化，请重新检索后再修改。")
+
+            if not force_safety:
+                warnings = [
+                    warning
+                    for target in targets
+                    if (
+                        warning := safety_warning_entry(
+                            target["file"],
+                            target["field"],
+                            target["pathDisplay"],
+                            target["value"],
+                            new_value,
+                        )
+                    )
+                ]
+                if warnings:
+                    return {
+                        "changed": False,
+                        "blockedBySafety": True,
+                        "unsafeFields": len(warnings),
+                        "warnings": warnings[:8],
+                    }
+
+            root = self.require_bound()
+            stamp = local_stamp()
+            operation_id = new_operation_id("update_reference")
+            overrides = load_json_sidecar(OVERRIDES_FILE, {})
+            by_file: dict[str, list[dict]] = {}
+            for target in targets:
+                by_file.setdefault(target["file"], []).append(target)
+
+            changed = 0
+            conflicts = 0
+            changed_files = 0
+            for rel, file_targets in by_file.items():
+                file_path = self.resolve_file(rel)
+                data, encoding, newline = read_json_document(file_path)
+                touched = False
+                file_backup = ""
+                for target in file_targets:
+                    json_path = target["path"]
+                    try:
+                        current = get_by_path(data, json_path)
+                    except Exception:
+                        conflicts += 1
+                        continue
+                    if current == new_value:
+                        continue
+                    if current != expected_value:
+                        conflicts += 1
+                        continue
+                    if not file_backup:
+                        file_backup = backup_file(file_path, root, stamp)
+                    set_by_path(data, json_path, new_value)
+                    key = make_key(rel, json_path)
+                    previous = overrides.get(key, {})
+                    override = {
+                        **previous,
+                        "key": key,
+                        "file": rel,
+                        "path": json_path,
+                        "pointer": path_to_pointer(json_path),
+                        "field": target["field"],
+                        "category": target["category"],
+                        "sinner": target.get("sinner"),
+                        "entryId": token,
+                        "label": new_value,
+                        "firstOriginal": previous.get("firstOriginal", current),
+                        "lastSource": current,
+                        "value": new_value,
+                        "note": note or f"同步修改关联词条：{token}",
+                        "updatedAt": utc_now_iso(),
+                        "updateCount": int(previous.get("updateCount", 0)) + 1,
+                    }
+                    overrides[key] = override
+                    append_history(
+                        {
+                            "action": "update",
+                            "operationId": operation_id,
+                            "file": rel,
+                            "path": json_path,
+                            "pointer": override["pointer"],
+                            "field": target["field"],
+                            "oldValue": current,
+                            "newValue": new_value,
+                            "note": note or f"同步修改关联词条：{token}",
+                            "backupPath": file_backup,
+                        }
+                    )
+                    touched = True
+                    changed += 1
+                if touched:
+                    write_json_document(file_path, data, encoding, newline)
+                    changed_files += 1
+
+            if changed:
+                save_json_sidecar(OVERRIDES_FILE, overrides)
+                self.index_valid = False
+
+        return {
+            "changed": changed > 0,
+            "fields": changed,
+            "files": changed_files,
+            "conflicts": conflicts,
+            "message": "关联词条没有可写入的变化。" if not changed else "",
+        }
+
     def reapply_overrides(self, payload: dict) -> dict:
         dry_run = bool(payload.get("dryRun", False))
         overrides = load_json_sidecar(OVERRIDES_FILE, {})
@@ -1610,6 +1838,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/update":
             self.send_json(STATE.update_value(payload))
+            return
+        if path == "/api/update-reference":
+            self.send_json(STATE.update_reference(payload))
             return
         if path == "/api/reapply":
             self.send_json(STATE.reapply_overrides(payload))
