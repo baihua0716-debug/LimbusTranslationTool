@@ -241,6 +241,11 @@ textarea:focus {
   gap: 8px;
 }
 
+.secondary-action {
+  width: 100%;
+  margin: 0 0 14px;
+}
+
 .results {
   display: grid;
   grid-template-rows: auto 1fr;

@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 import webbrowser
 import zipfile
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -291,6 +292,66 @@ def clean_preview(value: str, limit: int = 180) -> str:
     return value[: limit - 1] + "…"
 
 
+DASH_TRANSLATION = str.maketrans(
+    {
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u2212": "-",
+        "\ufe58": "-",
+        "\ufe63": "-",
+        "\uff0d": "-",
+        "\\": "/",
+    }
+)
+
+
+def normalize_search_text(value) -> str:
+    text = unicodedata.normalize("NFKC", str(value))
+    return text.translate(DASH_TRANSLATION).casefold()
+
+
+def compact_normalized_search_text(value: str) -> str:
+    return re.sub(r"[\W_]+", "", value, flags=re.UNICODE)
+
+
+def compact_search_text(value) -> str:
+    return compact_normalized_search_text(normalize_search_text(value))
+
+
+def prepare_search_query(query: str) -> tuple[str, str]:
+    normalized = normalize_search_text(query).strip()
+    if not normalized:
+        return "", ""
+    return normalized, compact_search_text(query)
+
+
+def make_search_blob(parts: list) -> tuple[str, str]:
+    normalized = "\n".join(normalize_search_text(part) for part in parts if part is not None)
+    return normalized, compact_normalized_search_text(normalized)
+
+
+def search_matches_prepared(prepared_query: tuple[str, str], normalized_haystack: str, compact_haystack: str) -> bool:
+    normalized_query, compact_query = prepared_query
+    if not normalized_query:
+        return True
+    if normalized_query in normalized_haystack:
+        return True
+    return bool(compact_query and compact_query in compact_haystack)
+
+
+def search_matches(query: str, parts: list) -> bool:
+    normalized_haystack, compact_haystack = make_search_blob(parts)
+    return search_matches_prepared(prepare_search_query(query), normalized_haystack, compact_haystack)
+
+
+def public_record(record: dict) -> dict:
+    return {key: value for key, value in record.items() if not key.startswith("_")}
+
+
 def term_occurrences(value: str, old_text: str, match_case: bool) -> int:
     if not old_text:
         return 0
@@ -507,25 +568,41 @@ class AppState:
                 entry_id = extract_entry_id(ancestors)
                 sinner = infer_sinner(rel, entry_id)
                 pointer = path_to_pointer(json_path)
+                path_display = path_to_display(json_path)
+                field = str(leaf_key)
+                category_label = CATEGORY_LABELS.get(category, category)
+                sinner_label = SINNER_BY_ID.get(sinner or "", {}).get("label", "")
+                label = extract_label(ancestors, leaf_key, value)
+                file_search, file_search_compact = make_search_blob([rel])
+                field_search, field_search_compact = make_search_blob([field, path_display])
+                full_search, full_search_compact = make_search_blob(
+                    [value, label, rel, field, entry_id, path_display, category_label, sinner_label]
+                )
                 key = f"{rel}|{pointer}"
                 record = {
                     "key": key,
                     "file": rel,
                     "path": json_path,
                     "pointer": pointer,
-                    "pathDisplay": path_to_display(json_path),
-                    "field": str(leaf_key),
+                    "pathDisplay": path_display,
+                    "field": field,
                     "value": value,
                     "preview": clean_preview(value),
                     "valueHash": sha1_text(value),
                     "category": category,
-                    "categoryLabel": CATEGORY_LABELS.get(category, category),
+                    "categoryLabel": category_label,
                     "sinner": sinner,
-                    "sinnerLabel": SINNER_BY_ID.get(sinner or "", {}).get("label", ""),
+                    "sinnerLabel": sinner_label,
                     "entryId": entry_id,
-                    "label": extract_label(ancestors, leaf_key, value),
+                    "label": label,
                     "encoding": encoding,
                     "hasOverride": key in overrides,
+                    "_fileSearch": file_search,
+                    "_fileSearchCompact": file_search_compact,
+                    "_fieldSearch": field_search,
+                    "_fieldSearchCompact": field_search_compact,
+                    "_search": full_search,
+                    "_searchCompact": full_search_compact,
                 }
                 records.append(record)
 
@@ -569,14 +646,17 @@ class AppState:
 
     def search(self, payload: dict) -> dict:
         self.ensure_index()
-        query = str(payload.get("query", "")).strip().lower()
+        query = str(payload.get("query", "")).strip()
         category = payload.get("category", "all") or "all"
         sinner = payload.get("sinner", "all") or "all"
-        file_query = str(payload.get("fileQuery", "")).strip().lower()
-        field_query = str(payload.get("fieldQuery", "")).strip().lower()
+        file_query = str(payload.get("fileQuery", "")).strip()
+        field_query = str(payload.get("fieldQuery", "")).strip()
         modified_only = bool(payload.get("modifiedOnly", False))
         limit = int(payload.get("limit", 250) or 250)
         limit = max(1, min(limit, 1000))
+        query_prepared = prepare_search_query(query)
+        file_prepared = prepare_search_query(file_query)
+        field_prepared = prepare_search_query(field_query)
 
         matches = []
         total = 0
@@ -587,27 +667,19 @@ class AppState:
                 continue
             if modified_only and not record.get("hasOverride"):
                 continue
-            if file_query and file_query not in record["file"].lower():
+            if file_query and not search_matches_prepared(
+                file_prepared, record["_fileSearch"], record["_fileSearchCompact"]
+            ):
                 continue
-            if field_query and field_query not in record["field"].lower():
+            if field_query and not search_matches_prepared(
+                field_prepared, record["_fieldSearch"], record["_fieldSearchCompact"]
+            ):
                 continue
-            if query:
-                haystack = "\n".join(
-                    str(part)
-                    for part in (
-                        record["value"],
-                        record["label"],
-                        record["file"],
-                        record["field"],
-                        record["entryId"],
-                    )
-                    if part is not None
-                ).lower()
-                if query not in haystack:
-                    continue
+            if query and not search_matches_prepared(query_prepared, record["_search"], record["_searchCompact"]):
+                continue
             total += 1
             if len(matches) < limit:
-                matches.append(record)
+                matches.append(public_record(record))
 
         return {
             "results": matches,
@@ -619,18 +691,22 @@ class AppState:
     def record_in_scope(self, record: dict, scope: dict) -> bool:
         category = scope.get("category", "all") or "all"
         sinner = scope.get("sinner", "all") or "all"
-        file_query = str(scope.get("fileQuery", "")).strip().lower()
-        field_query = str(scope.get("fieldQuery", "")).strip().lower()
+        file_query = str(scope.get("fileQuery", "")).strip()
+        field_query = str(scope.get("fieldQuery", "")).strip()
         modified_only = bool(scope.get("modifiedOnly", False))
+        file_prepared = scope.get("_filePrepared") or prepare_search_query(file_query)
+        field_prepared = scope.get("_fieldPrepared") or prepare_search_query(field_query)
         if category != "all" and record["category"] != category:
             return False
         if sinner != "all" and record["sinner"] != sinner:
             return False
         if modified_only and not record.get("hasOverride"):
             return False
-        if file_query and file_query not in record["file"].lower():
+        if file_query and not search_matches_prepared(file_prepared, record["_fileSearch"], record["_fileSearchCompact"]):
             return False
-        if field_query and field_query not in record["field"].lower():
+        if field_query and not search_matches_prepared(
+            field_prepared, record["_fieldSearch"], record["_fieldSearchCompact"]
+        ):
             return False
         return True
 
@@ -644,6 +720,11 @@ class AppState:
         if old_text == new_text:
             raise UserFacingError("原词和新译名相同，不需要批量替换。")
         scope = payload.get("scope") if isinstance(payload.get("scope"), dict) else {}
+        scope = {
+            **scope,
+            "_filePrepared": prepare_search_query(str(scope.get("fileQuery", "")).strip()),
+            "_fieldPrepared": prepare_search_query(str(scope.get("fieldQuery", "")).strip()),
+        }
         items = []
         for record in self.index:
             if not self.record_in_scope(record, scope):

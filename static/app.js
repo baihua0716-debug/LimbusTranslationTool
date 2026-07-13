@@ -2,6 +2,7 @@ const state = {
   status: null,
   selected: null,
   searchTimer: null,
+  searchSeq: 0,
   bulkSignature: "",
 };
 
@@ -130,8 +131,10 @@ async function runSearch() {
     $("resultCount").textContent = "0";
     return;
   }
+  const seq = ++state.searchSeq;
   try {
     const data = await post("/api/search", selectedPayload());
+    if (seq !== state.searchSeq) return;
     renderResults(data.results || [], data.total || 0, data.limited);
     if (data.stats) {
       state.status.stats = data.stats;
@@ -139,6 +142,7 @@ async function runSearch() {
       updateStatusLine();
     }
   } catch (error) {
+    if (seq !== state.searchSeq) return;
     showToast(error.message, true);
   }
 }
@@ -150,8 +154,14 @@ function renderResults(results, total, limited) {
   if (!results.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "没有匹配项。";
+    empty.innerHTML = `
+      <div>
+        <p>没有匹配项。</p>
+        <button id="emptyClearFiltersButton" type="button">清空筛选</button>
+      </div>
+    `;
     list.appendChild(empty);
+    $("emptyClearFiltersButton").addEventListener("click", resetFilters);
     return;
   }
   for (const item of results) {
@@ -196,6 +206,21 @@ function selectResult(item) {
 function renderResultsActiveOnly() {
   document.querySelectorAll(".result-item").forEach((node) => node.classList.remove("active"));
   document.querySelector(`.result-item[data-key="${CSS.escape(state.selected?.key || "")}"]`)?.classList.add("active");
+}
+
+function resetFilters() {
+  $("queryInput").value = "";
+  $("fileInput").value = "";
+  $("fieldInput").value = "";
+  $("modifiedOnly").checked = false;
+  if ([...$("categorySelect").options].some((option) => option.value === "all")) {
+    $("categorySelect").value = "all";
+  }
+  if ([...$("sinnerSelect").options].some((option) => option.value === "all")) {
+    $("sinnerSelect").value = "all";
+  }
+  invalidateBulkPreview();
+  runSearch();
 }
 
 async function saveSelected() {
@@ -436,6 +461,7 @@ function initEvents() {
   $("bindButton").addEventListener("click", bindPath);
   $("reindexButton").addEventListener("click", reindex);
   $("shutdownButton").addEventListener("click", shutdownTool);
+  $("clearFiltersButton").addEventListener("click", resetFilters);
   $("saveButton").addEventListener("click", saveSelected);
   $("resetButton").addEventListener("click", () => {
     if (state.selected) $("editText").value = state.selected.value;
