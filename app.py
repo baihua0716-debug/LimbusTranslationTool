@@ -921,7 +921,6 @@ class AppState:
             }
 
     def search(self, payload: dict) -> dict:
-        self.ensure_index()
         query = str(payload.get("query", "")).strip()
         category = payload.get("category", "all") or "all"
         sinner = payload.get("sinner", "all") or "all"
@@ -930,6 +929,18 @@ class AppState:
         modified_only = bool(payload.get("modifiedOnly", False))
         limit = int(payload.get("limit", 250) or 250)
         limit = max(1, min(limit, 1000))
+        has_criteria = bool(
+            query
+            or category != "all"
+            or sinner != "all"
+            or file_query
+            or field_query
+            or modified_only
+        )
+        if not has_criteria:
+            return {"results": [], "total": 0, "limited": False, "stats": self.stats}
+
+        self.ensure_index()
         query_prepared = prepare_search_query(query)
         file_prepared = prepare_search_query(file_query)
         field_prepared = prepare_search_query(field_query)

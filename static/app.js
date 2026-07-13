@@ -88,6 +88,26 @@ function selectedPayload() {
   };
 }
 
+function hasSearchCriteria(payload) {
+  return Boolean(
+    payload.query.trim() ||
+      payload.category !== "all" ||
+      payload.sinner !== "all" ||
+      payload.fileQuery.trim() ||
+      payload.fieldQuery.trim() ||
+      payload.modifiedOnly,
+  );
+}
+
+function clearSearchDisplay() {
+  state.selected = null;
+  $("resultList").innerHTML = "";
+  $("resultCount").textContent = "0";
+  $("editorBody").classList.add("hidden");
+  $("emptyEditor").classList.remove("hidden");
+  $("selectionTag").textContent = "未选择";
+}
+
 function bulkScopePayload() {
   if (!$("bulkUseScope").checked) {
     return {};
@@ -131,13 +151,18 @@ function scheduleSearch() {
 
 async function runSearch() {
   if (!state.status?.bound) {
-    $("resultList").innerHTML = "";
-    $("resultCount").textContent = "0";
+    clearSearchDisplay();
+    return;
+  }
+  const payload = selectedPayload();
+  if (!hasSearchCriteria(payload)) {
+    ++state.searchSeq;
+    clearSearchDisplay();
     return;
   }
   const seq = ++state.searchSeq;
   try {
-    const data = await post("/api/search", selectedPayload());
+    const data = await post("/api/search", payload);
     if (seq !== state.searchSeq) return;
     renderResults(data.results || [], data.total || 0, data.limited);
     if (data.stats) {
