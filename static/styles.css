@@ -266,6 +266,17 @@ textarea:focus {
   gap: 8px;
 }
 
+.restore-action {
+  border-color: #c58c82;
+  color: #833b31;
+  background: #fff8f6;
+}
+
+.restore-action:hover {
+  border-color: #9e5145;
+  background: #fff1ee;
+}
+
 .secondary-action {
   width: 100%;
   margin: 0 0 14px;

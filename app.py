@@ -1252,7 +1252,7 @@ class AppState:
         }
 
     def undo_last_operation(self) -> dict:
-        undoable_actions = {"update", "bulk_replace", "reapply"}
+        undoable_actions = {"update", "bulk_replace", "reapply", "restore_originals"}
         with self.lock:
             entries = read_history_entries()
             undone_keys = {
@@ -1337,7 +1337,21 @@ class AppState:
 
                     key = make_key(rel, json_path)
                     previous = overrides.get(key, {})
-                    if previous and previous.get("firstOriginal") == old_value:
+                    restored_override = entry.get("restoredOverride")
+                    if entry.get("action") == "restore_originals" and isinstance(restored_override, dict):
+                        overrides[key] = {
+                            **restored_override,
+                            "key": key,
+                            "file": rel,
+                            "path": json_path,
+                            "pointer": path_to_pointer(json_path),
+                            "lastSource": new_value,
+                            "value": old_value,
+                            "note": f"撤销恢复零协原文：{candidate_key}",
+                            "updatedAt": utc_now_iso(),
+                            "updateCount": int(restored_override.get("updateCount", 0)) + 1,
+                        }
+                    elif previous and previous.get("firstOriginal") == old_value:
                         overrides.pop(key, None)
                     else:
                         overrides[key] = {
@@ -1603,6 +1617,160 @@ class AppState:
             "message": "关联词条没有可写入的变化。" if not changed else "",
         }
 
+    def restore_originals(self) -> dict:
+        with self.lock:
+            root = self.require_bound()
+            overrides = load_json_sidecar(OVERRIDES_FILE, {})
+            if not overrides:
+                return {
+                    "changed": 0,
+                    "files": 0,
+                    "skipped": 0,
+                    "conflicts": 0,
+                    "missing": 0,
+                    "remaining": 0,
+                    "items": [],
+                }
+
+            stamp = local_stamp()
+            operation_id = new_operation_id("restore_originals")
+            by_file: dict[str, list[tuple[str, dict]]] = {}
+            invalid_keys = []
+            for key, override in overrides.items():
+                rel = normalise_rel(str(override.get("file", "")))
+                json_path = override.get("path")
+                if not rel or not isinstance(json_path, list):
+                    invalid_keys.append(key)
+                    continue
+                by_file.setdefault(rel, []).append((key, override))
+
+            changed = 0
+            changed_files = 0
+            skipped = 0
+            conflicts = 0
+            missing = len(invalid_keys)
+            metadata_changed = False
+            items = []
+            for key in invalid_keys:
+                items.append({"file": "", "status": "missing", "message": f"修正记录路径无效：{key}"})
+
+            for rel, file_overrides in by_file.items():
+                try:
+                    file_path = self.resolve_file(rel)
+                    data, encoding, newline = read_json_document(file_path)
+                except Exception as exc:
+                    missing += len(file_overrides)
+                    items.append({"file": rel, "status": "missing", "message": str(exc)})
+                    continue
+
+                touched = False
+                file_backup = ""
+                for key, override in file_overrides:
+                    json_path = override["path"]
+                    original = override.get("firstOriginal")
+                    custom = override.get("value")
+                    if not isinstance(original, str) or not isinstance(custom, str):
+                        missing += 1
+                        items.append(
+                            {
+                                "file": rel,
+                                "path": json_path,
+                                "field": override.get("field", ""),
+                                "status": "missing",
+                                "message": "修正记录缺少零协原文或自定义译文。",
+                            }
+                        )
+                        continue
+                    try:
+                        current = get_by_path(data, json_path)
+                    except Exception as exc:
+                        missing += 1
+                        items.append(
+                            {
+                                "file": rel,
+                                "path": json_path,
+                                "field": override.get("field", ""),
+                                "status": "missing",
+                                "message": str(exc),
+                            }
+                        )
+                        continue
+                    if not isinstance(current, str):
+                        missing += 1
+                        items.append(
+                            {
+                                "file": rel,
+                                "path": json_path,
+                                "field": override.get("field", ""),
+                                "status": "missing",
+                                "message": "当前位置已不再是文本字段。",
+                            }
+                        )
+                        continue
+                    if current == original:
+                        overrides.pop(key, None)
+                        metadata_changed = True
+                        skipped += 1
+                        items.append({"file": rel, "path": json_path, "status": "already_original"})
+                        continue
+                    if current != custom:
+                        conflicts += 1
+                        items.append(
+                            {
+                                "file": rel,
+                                "path": json_path,
+                                "field": override.get("field", ""),
+                                "status": "conflict",
+                                "current": clean_preview(current, 140),
+                                "custom": clean_preview(custom, 140),
+                                "original": clean_preview(original, 140),
+                                "message": "当前文本已被其他更新修改，已跳过。",
+                            }
+                        )
+                        continue
+
+                    if not file_backup:
+                        file_backup = backup_file(file_path, root, stamp)
+                    set_by_path(data, json_path, original)
+                    append_history(
+                        {
+                            "action": "restore_originals",
+                            "operationId": operation_id,
+                            "file": rel,
+                            "path": json_path,
+                            "pointer": path_to_pointer(json_path),
+                            "field": override.get("field", str(json_path[-1]) if json_path else ""),
+                            "oldValue": current,
+                            "newValue": original,
+                            "note": "恢复零协原文",
+                            "backupPath": file_backup,
+                            "restoredOverride": override,
+                        }
+                    )
+                    overrides.pop(key, None)
+                    metadata_changed = True
+                    touched = True
+                    changed += 1
+                    items.append({"file": rel, "path": json_path, "status": "changed"})
+
+                if touched:
+                    write_json_document(file_path, data, encoding, newline)
+                    changed_files += 1
+
+            if metadata_changed:
+                save_json_sidecar(OVERRIDES_FILE, overrides)
+                self.index_valid = False
+
+        return {
+            "changed": changed,
+            "files": changed_files,
+            "skipped": skipped,
+            "conflicts": conflicts,
+            "missing": missing,
+            "remaining": len(overrides),
+            "items": items[:200],
+        }
+
     def reapply_overrides(self, payload: dict) -> dict:
         dry_run = bool(payload.get("dryRun", False))
         overrides = load_json_sidecar(OVERRIDES_FILE, {})
@@ -1855,6 +2023,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/reapply":
             self.send_json(STATE.reapply_overrides(payload))
+            return
+        if path == "/api/restore-originals":
+            self.send_json(STATE.restore_originals())
             return
         if path == "/api/undo-last":
             self.send_json(STATE.undo_last_operation())

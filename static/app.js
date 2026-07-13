@@ -327,6 +327,7 @@ function renderHistory(items) {
       reapply: "重放",
       backup: "备份",
       bulk_replace: "批量替换",
+      restore_originals: "恢复零协原文",
       undo: "撤销",
     }[item.action] || item.action;
     node.innerHTML = `
@@ -463,6 +464,41 @@ async function reapply() {
   }
 }
 
+function showRestoreConflicts(items = []) {
+  const conflicts = items.filter((item) => item.status === "conflict");
+  if (!conflicts.length) return;
+  const lines = conflicts.slice(0, 8).map((item) => {
+    const location = [item.file, item.field].filter(Boolean).join(" · ");
+    return `${location}\n当前：${item.current || ""}\n工具记录的译文：${item.custom || ""}`;
+  });
+  const more = conflicts.length > lines.length ? `\n\n还有 ${conflicts.length - lines.length} 条冲突未显示。` : "";
+  window.alert(`有 ${conflicts.length} 条文本已被其他更新修改，恢复时已跳过。\n\n${lines.join("\n\n")}${more}`);
+}
+
+async function restoreOriginals() {
+  if (
+    !window.confirm(
+      "确认将本工具修改过的文本恢复为修改前的零协原文？\n\n写入前会自动备份；已被新版汉化或其他程序改动的文本会跳过。恢复后可用“撤销最近修改”取回自定义译文。",
+    )
+  ) {
+    return;
+  }
+  $("restoreOriginalsButton").disabled = true;
+  try {
+    const data = await post("/api/restore-originals", {});
+    showToast(
+      `恢复完成：${data.files} 个文件、${data.changed} 个字段；已是原文 ${data.skipped} 个，冲突 ${data.conflicts} 个，缺失 ${data.missing} 个。`,
+      Boolean(data.conflicts || data.missing),
+    );
+    showRestoreConflicts(data.items || []);
+    await Promise.all([runSearch(), loadHistory()]);
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    $("restoreOriginalsButton").disabled = false;
+  }
+}
+
 async function backup() {
   try {
     const data = await post("/api/backup", {});
@@ -474,7 +510,11 @@ async function backup() {
 }
 
 async function undoLast() {
-  if (!window.confirm("确认撤销最近一次写入操作？\n\n工具会先备份当前 JSON，再把最近一次保存、批量替换或重放历史回退。")) {
+  if (
+    !window.confirm(
+      "确认撤销最近一次写入操作？\n\n工具会先备份当前 JSON，再把最近一次保存、批量替换、重放历史或恢复零协原文回退。",
+    )
+  ) {
     return;
   }
   $("undoLastButton").disabled = true;
@@ -588,6 +628,7 @@ function initEvents() {
   });
   $("refreshHistoryButton").addEventListener("click", loadHistory);
   $("reapplyButton").addEventListener("click", reapply);
+  $("restoreOriginalsButton").addEventListener("click", restoreOriginals);
   $("backupButton").addEventListener("click", backup);
   $("undoLastButton").addEventListener("click", undoLast);
   $("bulkPreviewButton").addEventListener("click", previewBulkReplace);
