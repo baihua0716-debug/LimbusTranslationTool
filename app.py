@@ -245,6 +245,91 @@ def path_to_display(path: list) -> str:
     return display
 
 
+INTERNAL_FIELD_NAMES = {
+    "key",
+    "code",
+    "type",
+    "subtype",
+    "group",
+    "sort",
+    "order",
+    "index",
+    "filename",
+    "filepath",
+    "path",
+    "url",
+    "icon",
+    "iconid",
+    "image",
+    "imageid",
+    "sprite",
+    "spriteid",
+    "asset",
+    "assetid",
+    "resource",
+    "resourceid",
+    "modelid",
+    "prefab",
+    "prefabname",
+    "sound",
+    "soundid",
+    "voice",
+    "voiceid",
+    "effect",
+    "effectid",
+    "animation",
+    "animationid",
+    "anim",
+    "animid",
+}
+ALWAYS_INTERNAL_FIELD_NAMES = {"id", "ids", "uid", "uuid", "guid"}
+INTERNAL_FIELD_HINTS = (
+    "resource",
+    "asset",
+    "prefab",
+    "sprite",
+    "icon",
+    "image",
+    "model",
+    "sound",
+    "voice",
+    "effect",
+    "anim",
+    "path",
+    "file",
+)
+IDENTIFIER_VALUE_RE = re.compile(r"^[A-Za-z0-9_.:/\\#@+\-]+$")
+
+
+def normalise_field_name(value) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).casefold())
+
+
+def looks_like_identifier_value(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    if len(text) > 180:
+        return False
+    return bool(IDENTIFIER_VALUE_RE.fullmatch(text) and re.search(r"[A-Za-z]", text))
+
+
+def is_internal_string_field(path: list, value: str) -> bool:
+    if not path:
+        return False
+    field = normalise_field_name(path[-1])
+    if field in ALWAYS_INTERNAL_FIELD_NAMES:
+        return True
+    if field in INTERNAL_FIELD_NAMES and looks_like_identifier_value(value):
+        return True
+    if looks_like_identifier_value(value):
+        if field.endswith(("id", "ids", "key", "code")):
+            return True
+        if any(hint in field for hint in INTERNAL_FIELD_HINTS):
+            return True
+    return False
+
+
 def walk_strings(obj, path=None, ancestors=None):
     path = [] if path is None else path
     ancestors = [] if ancestors is None else ancestors
@@ -301,6 +386,8 @@ FORMAT_TOKEN_PATTERNS = [
     ("escape", "反斜杠控制符", re.compile(r"\\[nrt]")),
 ]
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+COMPACT_SEARCH_MIN_LENGTH = 3
+FORMAT_SEARCH_CHARS = set("{}<>[]%")
 
 
 def counter_for_pattern(pattern: re.Pattern, value: str) -> Counter:
@@ -413,7 +500,10 @@ def prepare_search_query(query: str) -> tuple[str, str]:
     normalized = normalize_search_text(query).strip()
     if not normalized:
         return "", ""
-    return normalized, compact_search_text(query)
+    compact = compact_search_text(query)
+    if len(compact) < COMPACT_SEARCH_MIN_LENGTH or any(char in normalized for char in FORMAT_SEARCH_CHARS):
+        compact = ""
+    return normalized, compact
 
 
 def make_search_blob(parts: list) -> tuple[str, str]:
@@ -651,6 +741,8 @@ class AppState:
 
             category = infer_category(rel)
             for json_path, value, ancestors in walk_strings(data):
+                if is_internal_string_field(json_path, value):
+                    continue
                 leaf_key = json_path[-1] if json_path else ""
                 entry_id = extract_entry_id(ancestors)
                 sinner = infer_sinner(rel, entry_id)
