@@ -236,6 +236,31 @@ textarea:focus {
   margin-bottom: 2px;
 }
 
+.safety-warning {
+  border: 1px solid rgba(180, 73, 73, 0.28);
+  border-radius: 6px;
+  padding: 8px;
+  background: #fff7f5;
+  color: var(--danger);
+  font-size: 12px;
+  word-break: break-word;
+}
+
+.safety-warning + .safety-warning {
+  margin-top: 6px;
+}
+
+.safety-warning strong {
+  display: block;
+  color: #833535;
+  margin-bottom: 3px;
+}
+
+.safety-warning ul {
+  margin: 5px 0 0 16px;
+  padding: 0;
+}
+
 .actions {
   display: grid;
   gap: 8px;

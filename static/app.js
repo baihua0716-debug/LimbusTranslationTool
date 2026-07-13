@@ -101,13 +101,17 @@ function bulkScopePayload() {
   };
 }
 
-function bulkPayload() {
-  return {
+function bulkPayload(forceSafety = false) {
+  const payload = {
     oldText: $("bulkOldInput").value,
     newText: $("bulkNewInput").value,
     matchCase: $("bulkMatchCase").checked,
     scope: bulkScopePayload(),
   };
+  if (forceSafety) {
+    payload.forceSafety = true;
+  }
+  return payload;
 }
 
 function bulkSignature() {
@@ -223,7 +227,7 @@ function resetFilters() {
   runSearch();
 }
 
-async function saveSelected() {
+async function saveSelected(forceSafety = false) {
   if (!state.selected) return;
   try {
     const data = await post("/api/update", {
@@ -233,7 +237,16 @@ async function saveSelected() {
       note: $("noteInput").value,
       entryId: state.selected.entryId,
       label: state.selected.label,
+      forceSafety,
     });
+    if (data.blockedBySafety) {
+      if (confirmSafetyOverride(data.warnings || [], "这次保存可能破坏游戏文本的格式标记。")) {
+        await saveSelected(true);
+      } else {
+        showToast("已取消保存，未写入文件。", true);
+      }
+      return;
+    }
     if (data.changed) {
       showToast("已保存，原文件已备份。");
       state.selected.value = $("editText").value;
@@ -305,6 +318,51 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+function safetyWarningLines(warnings = []) {
+  const lines = [];
+  for (const item of warnings) {
+    const location = [item.file, item.field, item.pathDisplay].filter(Boolean).join(" · ");
+    lines.push(location || "未知位置");
+    for (const warning of item.warnings || []) {
+      lines.push(`- ${warning.message}`);
+    }
+  }
+  return lines;
+}
+
+function confirmSafetyOverride(warnings, title) {
+  const lines = safetyWarningLines(warnings).slice(0, 28);
+  const more = safetyWarningLines(warnings).length > lines.length ? "\n\n还有更多风险项未显示。" : "";
+  return window.confirm(`${title}\n\n${lines.join("\n")}${more}\n\n仍要写入吗？`);
+}
+
+function renderSafetyWarnings(warnings = []) {
+  return warnings
+    .map(
+      (item) => `
+        <div class="safety-warning">
+          <strong>${escapeHtml(item.file)} · ${escapeHtml(item.field || "")}</strong>
+          <div>${escapeHtml(item.pathDisplay || "")}</div>
+          <ul>
+            ${(item.warnings || []).map((warning) => `<li>${escapeHtml(warning.message)}</li>`).join("")}
+          </ul>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function showReapplyConflicts(items = []) {
+  const conflicts = items.filter((item) => item.status === "conflict");
+  if (!conflicts.length) return;
+  const lines = conflicts.slice(0, 8).map((item) => {
+    const location = [item.file, item.field].filter(Boolean).join(" · ");
+    return `${location}\n当前：${item.current || ""}\n历史目标：${item.desired || ""}`;
+  });
+  const more = conflicts.length > lines.length ? `\n\n还有 ${conflicts.length - lines.length} 条冲突未显示。` : "";
+  window.alert(`有 ${conflicts.length} 条历史修改因源文本变化被跳过。\n\n${lines.join("\n\n")}${more}`);
+}
+
 async function bindPath() {
   $("bindButton").disabled = true;
   try {
@@ -353,7 +411,11 @@ async function reapply() {
   if (!window.confirm("将把历史修正重新写回当前绑定目录。继续？")) return;
   try {
     const data = await post("/api/reapply", {});
-    showToast(`重放完成：写回 ${data.changed} 条，跳过 ${data.skipped} 条，缺失 ${data.missing} 条。`);
+    showToast(
+      `重放完成：写回 ${data.changed} 条，跳过 ${data.skipped} 条，冲突 ${data.conflicts || 0} 条，缺失 ${data.missing} 条。`,
+      Boolean(data.conflicts),
+    );
+    showReapplyConflicts(data.items || []);
     await Promise.all([runSearch(), loadHistory()]);
   } catch (error) {
     showToast(error.message, true);
@@ -408,6 +470,10 @@ function renderBulkPreview(data) {
     return;
   }
   summary.textContent = `将影响 ${data.files} 个文件、${data.fields} 个文本字段，共 ${data.occurrences} 处。`;
+  if (data.unsafeFields) {
+    summary.textContent += ` 其中 ${data.unsafeFields} 个字段存在格式风险，执行时会要求二次确认。`;
+    examples.insertAdjacentHTML("beforeend", renderSafetyWarnings(data.safetyWarnings || []));
+  }
   for (const item of data.examples || []) {
     const node = document.createElement("div");
     node.className = "bulk-example";
@@ -421,7 +487,7 @@ function renderBulkPreview(data) {
   }
 }
 
-async function applyBulkReplace() {
+async function applyBulkReplace(forceSafety = false) {
   const signature = bulkSignature();
   if (signature !== state.bulkSignature) {
     showToast("筛选或替换内容已变化，请先重新预览。", true);
@@ -430,12 +496,24 @@ async function applyBulkReplace() {
   }
   const oldText = $("bulkOldInput").value;
   const newText = $("bulkNewInput").value;
-  if (!window.confirm(`确认把所有命中的“${oldText}”替换为“${newText}”？\n\n工具会先备份涉及的 JSON 文件。`)) {
+  if (
+    !forceSafety &&
+    !window.confirm(`确认把所有命中的“${oldText}”替换为“${newText}”？\n\n工具会先备份涉及的 JSON 文件。`)
+  ) {
     return;
   }
   $("bulkApplyButton").disabled = true;
   try {
-    const data = await post("/api/bulk-replace", bulkPayload());
+    const data = await post("/api/bulk-replace", bulkPayload(forceSafety));
+    if (data.blockedBySafety) {
+      if (confirmSafetyOverride(data.warnings || [], `批量替换中有 ${data.unsafeFields || 0} 个字段可能破坏格式标记。`)) {
+        await applyBulkReplace(true);
+      } else {
+        showToast("已取消批量替换，未写入文件。", true);
+        $("bulkApplyButton").disabled = false;
+      }
+      return;
+    }
     showToast(`批量替换完成：${data.files} 个文件、${data.changed} 个字段、${data.occurrences} 处。`);
     invalidateBulkPreview();
     $("bulkSummary").textContent = "已完成。再次替换前请重新预览。";
@@ -443,6 +521,7 @@ async function applyBulkReplace() {
     await Promise.all([runSearch(), loadHistory()]);
   } catch (error) {
     showToast(error.message, true);
+    $("bulkApplyButton").disabled = false;
   }
 }
 

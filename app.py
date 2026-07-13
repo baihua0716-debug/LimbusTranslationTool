@@ -15,6 +15,7 @@ import traceback
 import unicodedata
 import webbrowser
 import zipfile
+from collections import Counter
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, unquote, urlparse
@@ -290,6 +291,92 @@ def clean_preview(value: str, limit: int = 180) -> str:
     if len(value) <= limit:
         return value
     return value[: limit - 1] + "…"
+
+
+FORMAT_TOKEN_PATTERNS = [
+    ("brace", "占位符", re.compile(r"\{[A-Za-z0-9_.$:+#,\- ]{1,80}\}")),
+    ("percent", "百分号格式符", re.compile(r"%(?:\d+\$)?[-+#0 ]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[bcdeEfFgGiosuxX]")),
+    ("tag", "富文本标签", re.compile(r"</?[A-Za-z][A-Za-z0-9_:-]*(?:\s+[^<>\r\n]{0,180})?/?>")),
+    ("square", "方括号标记", re.compile(r"\[[A-Za-z0-9_./:-]{1,80}\]")),
+    ("escape", "反斜杠控制符", re.compile(r"\\[nrt]")),
+]
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def counter_for_pattern(pattern: re.Pattern, value: str) -> Counter:
+    return Counter(match.group(0) for match in pattern.finditer(value))
+
+
+def token_sample(values: list[str], limit: int = 5) -> str:
+    items = [clean_preview(item, 40) for item in values[:limit]]
+    suffix = " 等" if len(values) > limit else ""
+    return "、".join(items) + suffix
+
+
+def compare_format_tokens(old_value: str, new_value: str) -> list[dict]:
+    warnings = []
+    for kind, label, pattern in FORMAT_TOKEN_PATTERNS:
+        before = counter_for_pattern(pattern, old_value)
+        after = counter_for_pattern(pattern, new_value)
+        missing = list((before - after).elements())
+        added = list((after - before).elements())
+        if not missing and not added:
+            continue
+        parts = []
+        if missing:
+            parts.append(f"缺少 {token_sample(missing)}")
+        if added:
+            parts.append(f"新增 {token_sample(added)}")
+        warnings.append(
+            {
+                "kind": kind,
+                "label": label,
+                "message": f"{label}变化：{'；'.join(parts)}。",
+            }
+        )
+    return warnings
+
+
+def text_safety_warnings(old_value: str, new_value: str) -> list[dict]:
+    if old_value == new_value:
+        return []
+
+    warnings = compare_format_tokens(old_value, new_value)
+    old_lines = old_value.count("\n")
+    new_lines = new_value.count("\n")
+    if old_lines != new_lines:
+        warnings.append(
+            {
+                "kind": "newline",
+                "label": "换行",
+                "message": f"换行数量变化：原 {old_lines + 1} 行，新 {new_lines + 1} 行。",
+            }
+        )
+
+    control_count = len(CONTROL_CHAR_RE.findall(new_value))
+    if control_count:
+        warnings.append(
+            {
+                "kind": "control",
+                "label": "控制字符",
+                "message": f"新文本包含 {control_count} 个不可见控制字符，可能导致游戏解析异常。",
+            }
+        )
+    return warnings
+
+
+def safety_warning_entry(file: str, field: str, path_display: str, old_value: str, new_value: str) -> dict | None:
+    warnings = text_safety_warnings(old_value, new_value)
+    if not warnings:
+        return None
+    return {
+        "file": file,
+        "field": field,
+        "pathDisplay": path_display,
+        "before": clean_preview(old_value, 140),
+        "after": clean_preview(new_value, 140),
+        "warnings": warnings,
+    }
 
 
 DASH_TRANSLATION = str.maketrans(
@@ -740,9 +827,17 @@ class AppState:
         file_counts: dict[str, int] = {}
         occurrence_count = 0
         examples = []
+        safety_examples = []
+        unsafe_fields = 0
         for item in items:
             file_counts[item["file"]] = file_counts.get(item["file"], 0) + 1
             occurrence_count += item["occurrences"]
+            next_value = replace_term(item["value"], old_text, new_text, match_case)
+            warning = safety_warning_entry(item["file"], item["field"], item["pathDisplay"], item["value"], next_value)
+            if warning:
+                unsafe_fields += 1
+                if len(safety_examples) < 8:
+                    safety_examples.append(warning)
             if len(examples) < 10:
                 examples.append(
                     {
@@ -752,7 +847,7 @@ class AppState:
                         "categoryLabel": item["categoryLabel"],
                         "sinnerLabel": item["sinnerLabel"],
                         "before": clean_preview(item["value"], 140),
-                        "after": clean_preview(replace_term(item["value"], old_text, new_text, match_case), 140),
+                        "after": clean_preview(next_value, 140),
                         "occurrences": item["occurrences"],
                     }
                 )
@@ -763,12 +858,38 @@ class AppState:
             "files": len(file_counts),
             "topFiles": [{"file": file, "count": count} for file, count in top_files],
             "examples": examples,
+            "unsafeFields": unsafe_fields,
+            "safetyWarnings": safety_examples,
         }
 
     def bulk_replace(self, payload: dict) -> dict:
         old_text, new_text, match_case, items = self.bulk_candidates(payload)
         if not items:
             return {"changed": 0, "occurrences": 0, "files": 0, "missing": 0}
+        force_safety = bool(payload.get("forceSafety", False))
+        if not force_safety:
+            safety_examples = []
+            unsafe_fields = 0
+            for item in items:
+                next_value = replace_term(item["value"], old_text, new_text, match_case)
+                warning = safety_warning_entry(
+                    item["file"], item["field"], item["pathDisplay"], item["value"], next_value
+                )
+                if not warning:
+                    continue
+                unsafe_fields += 1
+                if len(safety_examples) < 8:
+                    safety_examples.append(warning)
+            if unsafe_fields:
+                return {
+                    "changed": 0,
+                    "occurrences": 0,
+                    "files": 0,
+                    "missing": 0,
+                    "blockedBySafety": True,
+                    "unsafeFields": unsafe_fields,
+                    "warnings": safety_examples,
+                }
 
         with self.lock:
             root = self.require_bound()
@@ -1018,6 +1139,7 @@ class AppState:
             raise UserFacingError("缺少 JSON 路径。")
         new_value = str(payload.get("newValue", ""))
         note = str(payload.get("note", "")).strip()
+        force_safety = bool(payload.get("forceSafety", False))
 
         with self.lock:
             root = self.require_bound()
@@ -1029,6 +1151,16 @@ class AppState:
                 raise UserFacingError("目标字段不是文本。")
             if old_value == new_value:
                 return {"changed": False, "message": "文本没有变化。"}
+            if not force_safety:
+                warning = safety_warning_entry(
+                    rel,
+                    str(json_path[-1]) if json_path else "",
+                    path_to_display(json_path),
+                    old_value,
+                    new_value,
+                )
+                if warning:
+                    return {"changed": False, "blockedBySafety": True, "warnings": [warning]}
 
             backup_path = backup_file(file_path, root)
             set_by_path(data, json_path, new_value)
@@ -1089,6 +1221,7 @@ class AppState:
             operation_id = new_operation_id("reapply")
             changed = 0
             skipped = 0
+            conflicts = 0
             missing = 0
             items = []
             by_file: dict[str, list[dict]] = {}
@@ -1110,6 +1243,11 @@ class AppState:
                 for override in file_overrides:
                     json_path = override.get("path")
                     desired = str(override.get("value", ""))
+                    expected_sources = []
+                    for key in ("lastSource", "firstOriginal"):
+                        value = override.get(key)
+                        if isinstance(value, str) and value not in expected_sources:
+                            expected_sources.append(value)
                     try:
                         current = get_by_path(data, json_path)
                     except Exception as exc:
@@ -1122,6 +1260,21 @@ class AppState:
                     if not isinstance(current, str):
                         missing += 1
                         items.append({"file": rel, "path": json_path, "status": "not_text"})
+                        continue
+                    if expected_sources and current not in expected_sources:
+                        conflicts += 1
+                        items.append(
+                            {
+                                "file": rel,
+                                "path": json_path,
+                                "field": str(json_path[-1]) if json_path else "",
+                                "status": "conflict",
+                                "current": clean_preview(current, 140),
+                                "expected": clean_preview(expected_sources[0], 140),
+                                "desired": clean_preview(desired, 140),
+                                "message": "当前源文本已变化，已跳过，避免把旧修改写入新版文本。",
+                            }
+                        )
                         continue
 
                     changed += 1
@@ -1152,7 +1305,7 @@ class AppState:
             if changed and not dry_run:
                 self.index_valid = False
 
-        return {"changed": changed, "skipped": skipped, "missing": missing, "items": items[:200]}
+        return {"changed": changed, "skipped": skipped, "missing": missing, "conflicts": conflicts, "items": items[:200]}
 
     def backup_all(self) -> dict:
         with self.lock:
