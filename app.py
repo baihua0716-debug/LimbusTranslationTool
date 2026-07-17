@@ -682,6 +682,10 @@ def make_key(rel: str, path: list) -> str:
     return f"{normalise_rel(rel)}|{path_to_pointer(path)}"
 
 
+def index_entry_key(rel: str, entry_id) -> tuple[str, str, str]:
+    return normalise_rel(rel), type(entry_id).__name__, str(entry_id)
+
+
 def backup_file(source: Path, bound_root: Path, stamp: str | None = None) -> str:
     stamp = stamp or local_stamp()
     rel = posix_rel(source, bound_root)
@@ -714,6 +718,24 @@ def read_history_entries() -> list[tuple[int, dict]]:
     return entries
 
 
+def read_tail_lines(path: Path, limit: int, chunk_size: int = 65536) -> list[bytes]:
+    if limit <= 0 or not path.exists():
+        return []
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        chunks = []
+        newline_count = 0
+        while position > 0 and newline_count <= limit:
+            read_size = min(chunk_size, position)
+            position -= read_size
+            handle.seek(position)
+            chunk = handle.read(read_size)
+            chunks.append(chunk)
+            newline_count += chunk.count(b"\n")
+    return b"".join(reversed(chunks)).splitlines()[-limit:]
+
+
 class AppState:
     def __init__(self):
         ensure_user_dirs()
@@ -721,8 +743,14 @@ class AppState:
         self.bound_path: Path | None = None
         self.input_path: str = ""
         self.index: list[dict] = []
+        self.index_by_key: dict[str, dict] = {}
+        self.index_by_entry: dict[tuple[str, str, str], list[dict]] = {}
+        self.keyword_records_by_id: dict[str, list[dict]] = {}
+        self.references_by_token: dict[str, list[tuple[dict, dict]]] = {}
         self.stats: dict = {}
         self.index_valid = False
+        self.overrides_cache: dict | None = None
+        self.overrides_signature: tuple[int, int] | None = None
         self.load_settings()
 
     def load_settings(self) -> None:
@@ -744,6 +772,28 @@ class AppState:
                 "updatedAt": utc_now_iso(),
             },
         )
+
+    def overrides_file_signature(self) -> tuple[int, int] | None:
+        try:
+            stat = OVERRIDES_FILE.stat()
+            return stat.st_mtime_ns, stat.st_size
+        except OSError:
+            return None
+
+    def load_overrides(self) -> dict:
+        with self.lock:
+            signature = self.overrides_file_signature()
+            if self.overrides_cache is None or signature != self.overrides_signature:
+                loaded = load_json_sidecar(OVERRIDES_FILE, {})
+                self.overrides_cache = loaded if isinstance(loaded, dict) else {}
+                self.overrides_signature = signature
+            return self.overrides_cache.copy()
+
+    def save_overrides(self, overrides: dict) -> None:
+        with self.lock:
+            save_json_sidecar(OVERRIDES_FILE, overrides)
+            self.overrides_cache = overrides.copy()
+            self.overrides_signature = self.overrides_file_signature()
 
     def bind(self, raw_path: str) -> dict:
         lang_dir = resolve_lang_dir(raw_path)
@@ -782,7 +832,7 @@ class AppState:
         records = []
         errors = []
         json_files = sorted(item for item in root.rglob("*.json") if item.is_file())
-        overrides = load_json_sidecar(OVERRIDES_FILE, {})
+        overrides = self.load_overrides()
         documents = []
         keyword_aliases: dict[str, set[str]] = {}
         for file_path in json_files:
@@ -890,6 +940,17 @@ class AppState:
                 sinner_counts[record["sinner"]] = sinner_counts.get(record["sinner"], 0) + 1
 
         self.index = records
+        self.index_by_key = {record["key"]: record for record in records}
+        self.index_by_entry = {}
+        self.keyword_records_by_id = {}
+        self.references_by_token = {}
+        for record in records:
+            key = index_entry_key(record["file"], record.get("entryId"))
+            self.index_by_entry.setdefault(key, []).append(record)
+            if record["category"] == "keyword" and isinstance(record.get("entryId"), str):
+                self.keyword_records_by_id.setdefault(record["entryId"], []).append(record)
+            for reference in record.get("_aliasReferences", []):
+                self.references_by_token.setdefault(reference["token"], []).append((record, reference))
         self.stats = {
             "files": len(json_files),
             "strings": len(records),
@@ -901,6 +962,104 @@ class AppState:
             "sinnerCounts": sinner_counts,
         }
         self.index_valid = True
+
+    def refresh_record_search_locked(self, record: dict) -> None:
+        alias_terms = []
+        seen_aliases = set()
+        for reference in record.get("_aliasReferences", []):
+            for alias in reference.get("aliases", []):
+                if alias in seen_aliases:
+                    continue
+                seen_aliases.add(alias)
+                alias_terms.append(alias)
+        direct_parts = [
+            record["value"],
+            record["label"],
+            record["file"],
+            record["field"],
+            record.get("entryId"),
+            record["pathDisplay"],
+            record["categoryLabel"],
+            record["sinnerLabel"],
+        ]
+        direct_search, direct_search_compact = make_search_blob(direct_parts)
+        full_search, full_search_compact = make_search_blob([*direct_parts, *alias_terms])
+        record["_directSearch"] = direct_search
+        record["_directSearchCompact"] = direct_search_compact
+        record["_search"] = full_search
+        record["_searchCompact"] = full_search_compact
+
+    def patch_index_values_locked(
+        self,
+        changes: list[tuple[str, list, str, str]],
+        overrides: dict,
+    ) -> bool:
+        if not changes:
+            return True
+        if not self.index_valid:
+            return False
+
+        records = []
+        for rel, json_path, old_value, new_value in changes:
+            key = make_key(rel, json_path)
+            record = self.index_by_key.get(key)
+            if record is None or record.get("value") != old_value:
+                self.index_valid = False
+                return False
+            if REFERENCE_TOKEN_RE.findall(old_value) != REFERENCE_TOKEN_RE.findall(new_value):
+                self.index_valid = False
+                return False
+            records.append((record, old_value, new_value))
+
+        affected: dict[str, dict] = {}
+        alias_tokens = set()
+        label_fields = {"namewithtitle", "title", "name", "abname"}
+        alias_fields = {"name", "title", "summary"}
+        for record, old_value, new_value in records:
+            record["value"] = new_value
+            record["preview"] = clean_preview(new_value)
+            record["valueHash"] = sha1_text(new_value)
+            record["hasOverride"] = record["key"] in overrides
+            affected[record["key"]] = record
+
+            old_label = clean_preview(old_value, 80)
+            new_label = clean_preview(new_value, 80)
+            field = normalise_field_name(record["field"])
+            if record.get("label") == old_label:
+                record["label"] = new_label
+            if field in label_fields:
+                entry_key = index_entry_key(record["file"], record.get("entryId"))
+                for sibling in self.index_by_entry.get(entry_key, []):
+                    if sibling.get("label") == old_label:
+                        sibling["label"] = new_label
+                        affected[sibling["key"]] = sibling
+            if (
+                record["category"] == "keyword"
+                and field in alias_fields
+                and isinstance(record.get("entryId"), str)
+            ):
+                alias_tokens.add(record["entryId"])
+
+        for token in alias_tokens:
+            aliases = sorted(
+                {
+                    candidate["value"].strip()
+                    for candidate in self.keyword_records_by_id.get(token, [])
+                    if normalise_field_name(candidate["field"]) in alias_fields
+                    and isinstance(candidate.get("value"), str)
+                    and candidate["value"].strip()
+                }
+            )
+            for source_record, reference in self.references_by_token.get(token, []):
+                reference["aliases"] = aliases
+                reference["_search"], reference["_searchCompact"] = make_search_blob(aliases)
+                affected[source_record["key"]] = source_record
+
+        for record in affected.values():
+            self.refresh_record_search_locked(record)
+        if self.stats:
+            self.stats["incrementalUpdatedAt"] = utc_now_iso()
+        return True
 
     def ensure_index(self) -> None:
         with self.lock:
@@ -1159,7 +1318,7 @@ class AppState:
             root = self.require_bound()
             stamp = local_stamp()
             operation_id = new_operation_id("bulk")
-            overrides = load_json_sidecar(OVERRIDES_FILE, {})
+            overrides = self.load_overrides()
             by_file: dict[str, list[dict]] = {}
             for item in items:
                 by_file.setdefault(item["file"], []).append(item)
@@ -1168,6 +1327,7 @@ class AppState:
             occurrence_count = 0
             missing = 0
             changed_files = 0
+            index_changes = []
             for rel, file_items in by_file.items():
                 try:
                     file_path = self.resolve_file(rel)
@@ -1235,14 +1395,15 @@ class AppState:
                     touched = True
                     changed += 1
                     occurrence_count += count
+                    index_changes.append((rel, json_path, current, next_value))
 
                 if touched:
                     write_json_document(file_path, data, encoding, newline)
                     changed_files += 1
 
             if changed:
-                save_json_sidecar(OVERRIDES_FILE, overrides)
-                self.index_valid = False
+                self.save_overrides(overrides)
+                self.patch_index_values_locked(index_changes, overrides)
 
         return {
             "changed": changed,
@@ -1289,7 +1450,7 @@ class AppState:
 
             root = self.require_bound()
             stamp = local_stamp()
-            overrides = load_json_sidecar(OVERRIDES_FILE, {})
+            overrides = self.load_overrides()
             by_file: dict[str, list[tuple[int, dict]]] = {}
             for index, entry in group:
                 if not entry.get("file") or not isinstance(entry.get("path"), list):
@@ -1303,6 +1464,7 @@ class AppState:
             conflicts = 0
             missing = 0
             changed_files = 0
+            index_changes = []
             for rel, file_entries in by_file.items():
                 try:
                     file_path = self.resolve_file(rel)
@@ -1374,14 +1536,15 @@ class AppState:
                         }
                     touched = True
                     changed += 1
+                    index_changes.append((rel, json_path, current, old_value))
 
                 if touched:
                     write_json_document(file_path, data, encoding, newline)
                     changed_files += 1
 
             if changed:
-                save_json_sidecar(OVERRIDES_FILE, overrides)
-                self.index_valid = False
+                self.save_overrides(overrides)
+                self.patch_index_values_locked(index_changes, overrides)
 
             append_history(
                 {
@@ -1444,7 +1607,7 @@ class AppState:
             set_by_path(data, json_path, new_value)
             write_json_document(file_path, data, encoding, newline)
 
-            overrides = load_json_sidecar(OVERRIDES_FILE, {})
+            overrides = self.load_overrides()
             key = make_key(rel, json_path)
             previous = overrides.get(key, {})
             entry_id = payload.get("entryId", previous.get("entryId"))
@@ -1467,7 +1630,7 @@ class AppState:
                 "updateCount": int(previous.get("updateCount", 0)) + 1,
             }
             overrides[key] = override
-            save_json_sidecar(OVERRIDES_FILE, overrides)
+            self.save_overrides(overrides)
 
             append_history(
                 {
@@ -1483,7 +1646,7 @@ class AppState:
                     "backupPath": backup_path,
                 }
             )
-            self.index_valid = False
+            self.patch_index_values_locked([(rel, json_path, old_value, new_value)], overrides)
 
         return {"changed": True, "backupPath": backup_path}
 
@@ -1536,7 +1699,7 @@ class AppState:
             root = self.require_bound()
             stamp = local_stamp()
             operation_id = new_operation_id("update_reference")
-            overrides = load_json_sidecar(OVERRIDES_FILE, {})
+            overrides = self.load_overrides()
             by_file: dict[str, list[dict]] = {}
             for target in targets:
                 by_file.setdefault(target["file"], []).append(target)
@@ -1544,6 +1707,7 @@ class AppState:
             changed = 0
             conflicts = 0
             changed_files = 0
+            index_changes = []
             for rel, file_targets in by_file.items():
                 file_path = self.resolve_file(rel)
                 data, encoding, newline = read_json_document(file_path)
@@ -1601,13 +1765,14 @@ class AppState:
                     )
                     touched = True
                     changed += 1
+                    index_changes.append((rel, json_path, current, new_value))
                 if touched:
                     write_json_document(file_path, data, encoding, newline)
                     changed_files += 1
 
             if changed:
-                save_json_sidecar(OVERRIDES_FILE, overrides)
-                self.index_valid = False
+                self.save_overrides(overrides)
+                self.patch_index_values_locked(index_changes, overrides)
 
         return {
             "changed": changed > 0,
@@ -1620,7 +1785,7 @@ class AppState:
     def restore_originals(self) -> dict:
         with self.lock:
             root = self.require_bound()
-            overrides = load_json_sidecar(OVERRIDES_FILE, {})
+            overrides = self.load_overrides()
             if not overrides:
                 return {
                     "changed": 0,
@@ -1651,6 +1816,7 @@ class AppState:
             missing = len(invalid_keys)
             metadata_changed = False
             items = []
+            index_changes = []
             for key in invalid_keys:
                 items.append({"file": "", "status": "missing", "message": f"修正记录路径无效：{key}"})
 
@@ -1711,6 +1877,7 @@ class AppState:
                         overrides.pop(key, None)
                         metadata_changed = True
                         skipped += 1
+                        index_changes.append((rel, json_path, current, current))
                         items.append({"file": rel, "path": json_path, "status": "already_original"})
                         continue
                     if current != custom:
@@ -1751,6 +1918,7 @@ class AppState:
                     metadata_changed = True
                     touched = True
                     changed += 1
+                    index_changes.append((rel, json_path, current, original))
                     items.append({"file": rel, "path": json_path, "status": "changed"})
 
                 if touched:
@@ -1758,8 +1926,8 @@ class AppState:
                     changed_files += 1
 
             if metadata_changed:
-                save_json_sidecar(OVERRIDES_FILE, overrides)
-                self.index_valid = False
+                self.save_overrides(overrides)
+                self.patch_index_values_locked(index_changes, overrides)
 
         return {
             "changed": changed,
@@ -1773,7 +1941,7 @@ class AppState:
 
     def reapply_overrides(self, payload: dict) -> dict:
         dry_run = bool(payload.get("dryRun", False))
-        overrides = load_json_sidecar(OVERRIDES_FILE, {})
+        overrides = self.load_overrides()
         if not overrides:
             return {"changed": 0, "skipped": 0, "missing": 0, "items": []}
 
@@ -1786,6 +1954,7 @@ class AppState:
             conflicts = 0
             missing = 0
             items = []
+            index_changes = []
             by_file: dict[str, list[dict]] = {}
             for override in overrides.values():
                 rel = normalise_rel(override.get("file", ""))
@@ -1845,6 +2014,7 @@ class AppState:
                         if not file_backup:
                             file_backup = backup_file(file_path, root, stamp)
                         set_by_path(data, json_path, desired)
+                        index_changes.append((rel, json_path, current, desired))
                         append_history(
                             {
                                 "action": "reapply",
@@ -1865,7 +2035,7 @@ class AppState:
                     write_json_document(file_path, data, encoding, newline)
 
             if changed and not dry_run:
-                self.index_valid = False
+                self.patch_index_values_locked(index_changes, overrides)
 
         return {"changed": changed, "skipped": skipped, "missing": missing, "conflicts": conflicts, "items": items[:200]}
 
@@ -1987,7 +2157,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json({"history": read_history(limit)})
             return
         if parsed.path == "/api/export-overrides":
-            overrides = load_json_sidecar(OVERRIDES_FILE, {})
+            overrides = STATE.load_overrides()
             payload = json.dumps(
                 {"exportedAt": utc_now_iso(), "boundPath": STATE.status().get("path"), "overrides": overrides},
                 ensure_ascii=False,
@@ -2052,12 +2222,11 @@ def read_history(limit: int) -> list[dict]:
     limit = max(1, min(limit, 500))
     if not HISTORY_FILE.exists():
         return []
-    lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
     items = []
-    for line in lines[-limit:]:
+    for raw_line in read_tail_lines(HISTORY_FILE, limit):
         try:
-            items.append(json.loads(line))
-        except json.JSONDecodeError:
+            items.append(json.loads(raw_line.decode("utf-8")))
+        except (UnicodeDecodeError, json.JSONDecodeError):
             continue
     return list(reversed(items))
 
