@@ -432,6 +432,11 @@ FORMAT_TOKEN_PATTERNS = [
     ("square", "方括号标记", re.compile(r"\[[A-Za-z0-9_./:-]{1,80}\]")),
     ("escape", "反斜杠控制符", re.compile(r"\\[nrt]")),
 ]
+COLOR_TAG_RE = re.compile(
+    r"<color=#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?>|"
+    r"</color(?:=#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?)?>",
+    re.IGNORECASE,
+)
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 COMPACT_SEARCH_MIN_LENGTH = 3
 FORMAT_SEARCH_CHARS = set("{}<>[]%")
@@ -447,11 +452,45 @@ def token_sample(values: list[str], limit: int = 5) -> str:
     return "、".join(items) + suffix
 
 
+def color_markup_balance(value: str) -> tuple[int, int]:
+    depth = 0
+    unmatched_closes = 0
+    for match in COLOR_TAG_RE.finditer(value):
+        if match.group(0).casefold().startswith("</color"):
+            if depth:
+                depth -= 1
+            else:
+                unmatched_closes += 1
+        else:
+            depth += 1
+    return unmatched_closes, depth
+
+
 def compare_format_tokens(old_value: str, new_value: str) -> list[dict]:
     warnings = []
+    old_color_balance = color_markup_balance(old_value)
+    new_color_balance = color_markup_balance(new_value)
+    if old_color_balance != new_color_balance:
+        warnings.append(
+            {
+                "kind": "tag",
+                "label": "富文本标签",
+                "message": (
+                    "颜色标签不完整："
+                    f"原文本有 {old_color_balance[0]} 个多余闭合、{old_color_balance[1]} 个未闭合，"
+                    f"新文本有 {new_color_balance[0]} 个多余闭合、{new_color_balance[1]} 个未闭合。"
+                ),
+            }
+        )
+
     for kind, label, pattern in FORMAT_TOKEN_PATTERNS:
-        before = counter_for_pattern(pattern, old_value)
-        after = counter_for_pattern(pattern, new_value)
+        old_for_count = old_value
+        new_for_count = new_value
+        if kind == "tag":
+            old_for_count = COLOR_TAG_RE.sub("", old_for_count)
+            new_for_count = COLOR_TAG_RE.sub("", new_for_count)
+        before = counter_for_pattern(pattern, old_for_count)
+        after = counter_for_pattern(pattern, new_for_count)
         missing = list((before - after).elements())
         added = list((after - before).elements())
         if not missing and not added:

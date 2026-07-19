@@ -116,6 +116,30 @@
                 <strong id="metaPath"></strong>
               </div>
             </div>
+            <div class="color-toolbar">
+              <span class="color-toolbar-label">文字颜色</span>
+              <input id="textColorInput" type="color" value="#f8c200" title="选择颜色" aria-label="选择颜色" />
+              <input
+                id="textColorHexInput"
+                type="text"
+                value="#F8C200"
+                maxlength="7"
+                spellcheck="false"
+                aria-label="十六进制颜色"
+              />
+              <div class="color-presets" aria-label="常用颜色">
+                <button class="color-swatch" type="button" data-color="#F8C200" title="金色" aria-label="金色"></button>
+                <button class="color-swatch" type="button" data-color="#E30000" title="红色" aria-label="红色"></button>
+                <button class="color-swatch" type="button" data-color="#80C9FF" title="浅蓝" aria-label="浅蓝"></button>
+                <button class="color-swatch" type="button" data-color="#00FF9C" title="绿色" aria-label="绿色"></button>
+                <button class="color-swatch" type="button" data-color="#EBCAA2" title="米白" aria-label="米白"></button>
+                <button class="color-swatch" type="button" data-color="#FFFFFF" title="白色" aria-label="白色"></button>
+              </div>
+              <div class="color-toolbar-actions">
+                <button id="applyTextColorButton" type="button">应用到选中文字</button>
+                <button id="removeTextColorButton" type="button">清除颜色</button>
+              </div>
+            </div>
             <textarea id="editText" spellcheck="false"></textarea>
             <input id="noteInput" type="text" placeholder="备注" />
             <div class="savebar">

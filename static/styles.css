@@ -443,6 +443,100 @@ textarea:focus {
   white-space: nowrap;
 }
 
+.color-toolbar {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f8faf8;
+}
+
+.color-toolbar-label {
+  color: var(--muted);
+  font-size: 12px;
+  margin-right: 2px;
+}
+
+#textColorInput {
+  flex: 0 0 36px;
+  width: 36px;
+  height: 32px;
+  padding: 3px;
+  cursor: pointer;
+}
+
+#textColorHexInput {
+  flex: 0 0 84px;
+  width: 84px;
+  height: 32px;
+  padding: 0 7px;
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.color-presets,
+.color-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.color-swatch {
+  --swatch: #ffffff;
+  flex: 0 0 26px;
+  width: 26px;
+  min-height: 26px;
+  height: 26px;
+  padding: 0;
+  border-color: #aeb6b1;
+  background: var(--swatch);
+}
+
+.color-swatch[data-color="#F8C200"] {
+  --swatch: #f8c200;
+}
+
+.color-swatch[data-color="#E30000"] {
+  --swatch: #e30000;
+}
+
+.color-swatch[data-color="#80C9FF"] {
+  --swatch: #80c9ff;
+}
+
+.color-swatch[data-color="#00FF9C"] {
+  --swatch: #00ff9c;
+}
+
+.color-swatch[data-color="#EBCAA2"] {
+  --swatch: #ebcaa2;
+}
+
+.color-swatch[data-color="#FFFFFF"] {
+  --swatch: #ffffff;
+}
+
+.color-swatch:hover,
+.color-swatch.active {
+  border-color: var(--ink);
+  box-shadow: 0 0 0 2px #fff, 0 0 0 3px var(--ink);
+}
+
+.color-toolbar-actions {
+  margin-left: auto;
+}
+
+.color-toolbar-actions button {
+  min-height: 32px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
 .savebar {
   display: flex;
   gap: 8px;

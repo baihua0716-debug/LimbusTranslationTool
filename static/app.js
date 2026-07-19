@@ -237,6 +237,169 @@ function renderResultsActiveOnly() {
   document.querySelector(`.result-item[data-key="${CSS.escape(state.selected?.key || "")}"]`)?.classList.add("active");
 }
 
+const COLOR_HEX_PATTERN = /^#?([0-9a-f]{6})$/i;
+const COLOR_TAG_PATTERN =
+  /<color=#[0-9a-f]{6}(?:[0-9a-f]{2})?>|<\/color(?:=#[0-9a-f]{6}(?:[0-9a-f]{2})?)?>/gi;
+
+function normalizeColorHex(value) {
+  const match = String(value || "")
+    .trim()
+    .match(COLOR_HEX_PATTERN);
+  return match ? `#${match[1].toUpperCase()}` : "";
+}
+
+function colorMarkupInfo(value) {
+  const stack = [];
+  const spans = [];
+  let unmatchedCloses = 0;
+  let tokenCount = 0;
+  for (const match of String(value).matchAll(COLOR_TAG_PATTERN)) {
+    tokenCount += 1;
+    const token = match[0];
+    if (token.toLowerCase().startsWith("</color")) {
+      const open = stack.pop();
+      if (!open) {
+        unmatchedCloses += 1;
+        continue;
+      }
+      spans.push({
+        openStart: open.start,
+        openEnd: open.end,
+        closeStart: match.index,
+        closeEnd: match.index + token.length,
+      });
+    } else {
+      stack.push({ start: match.index, end: match.index + token.length });
+    }
+  }
+  return {
+    spans,
+    tokenCount,
+    balanced: unmatchedCloses === 0 && stack.length === 0,
+  };
+}
+
+function findEnclosingColorMarkup(value, start, end) {
+  return (
+    colorMarkupInfo(value).spans
+      .filter((span) => start >= span.openEnd && end <= span.closeStart)
+      .sort(
+        (left, right) =>
+          left.closeEnd - left.openStart - (right.closeEnd - right.openStart),
+      )[0] || null
+  );
+}
+
+function setEditorValue(value, selectionStart, selectionEnd) {
+  const editor = $("editText");
+  editor.value = value;
+  editor.focus();
+  editor.setSelectionRange(selectionStart, selectionEnd);
+}
+
+function markActiveColorSwatch(color) {
+  document.querySelectorAll(".color-swatch").forEach((button) => {
+    button.classList.toggle("active", normalizeColorHex(button.dataset.color) === color);
+  });
+}
+
+function setTextColor(value) {
+  const color = normalizeColorHex(value);
+  if (!color) return false;
+  $("textColorInput").value = color.toLowerCase();
+  $("textColorHexInput").value = color;
+  markActiveColorSwatch(color);
+  return true;
+}
+
+function replaceColorOpeningTag(value, span, color, selectionStart, selectionEnd, selectWhole) {
+  const openingTag = `<color=${color}>`;
+  const oldOpeningLength = span.openEnd - span.openStart;
+  const delta = openingTag.length - oldOpeningLength;
+  const nextValue = `${value.slice(0, span.openStart)}${openingTag}${value.slice(span.openEnd)}`;
+  if (selectWhole) {
+    setEditorValue(nextValue, span.openStart, span.closeEnd + delta);
+  } else {
+    setEditorValue(nextValue, selectionStart + delta, selectionEnd + delta);
+  }
+}
+
+function applyTextColor() {
+  const color = normalizeColorHex($("textColorHexInput").value);
+  if (!color) {
+    showToast("请输入 6 位十六进制颜色，例如 #F8C200。", true);
+    $("textColorHexInput").focus();
+    return;
+  }
+  setTextColor(color);
+
+  const editor = $("editText");
+  const value = editor.value;
+  const start = editor.selectionStart;
+  const end = editor.selectionEnd;
+  const info = colorMarkupInfo(value);
+  const selectedSpan = info.spans.find(
+    (span) => span.openStart === start && span.closeEnd === end,
+  );
+  if (selectedSpan) {
+    replaceColorOpeningTag(value, selectedSpan, color, start, end, true);
+    return;
+  }
+
+  const enclosingSpan = findEnclosingColorMarkup(value, start, end);
+  if (enclosingSpan) {
+    replaceColorOpeningTag(value, enclosingSpan, color, start, end, false);
+    return;
+  }
+
+  if (start === end) {
+    showToast("请先在编辑框中选择要着色的文字。");
+    editor.focus();
+    return;
+  }
+
+  const selectedText = value.slice(start, end);
+  if (/[<>]/.test(selectedText)) {
+    showToast("选择范围包含格式标签，请只选择文字内容。", true);
+    editor.focus();
+    return;
+  }
+
+  const openingTag = `<color=${color}>`;
+  const closingTag = "</color>";
+  const nextValue = `${value.slice(0, start)}${openingTag}${selectedText}${closingTag}${value.slice(end)}`;
+  setEditorValue(nextValue, start + openingTag.length, end + openingTag.length);
+}
+
+function removeTextColor() {
+  const editor = $("editText");
+  const value = editor.value;
+  const start = editor.selectionStart;
+  const end = editor.selectionEnd;
+  const selectedText = value.slice(start, end);
+  const selectedInfo = colorMarkupInfo(selectedText);
+
+  if (selectedInfo.tokenCount && selectedInfo.balanced) {
+    const plainText = selectedText.replace(COLOR_TAG_PATTERN, "");
+    const nextValue = `${value.slice(0, start)}${plainText}${value.slice(end)}`;
+    setEditorValue(nextValue, start, start + plainText.length);
+    return;
+  }
+
+  const enclosingSpan = findEnclosingColorMarkup(value, start, end);
+  if (!enclosingSpan) {
+    showToast("当前选区不在带颜色的文字中。");
+    editor.focus();
+    return;
+  }
+
+  const openingLength = enclosingSpan.openEnd - enclosingSpan.openStart;
+  const innerText = value.slice(enclosingSpan.openEnd, enclosingSpan.closeStart);
+  const nextValue =
+    value.slice(0, enclosingSpan.openStart) + innerText + value.slice(enclosingSpan.closeEnd);
+  setEditorValue(nextValue, start - openingLength, end - openingLength);
+}
+
 function resetFilters() {
   $("queryInput").value = "";
   $("fileInput").value = "";
@@ -633,6 +796,26 @@ function initEvents() {
   $("undoLastButton").addEventListener("click", undoLast);
   $("bulkPreviewButton").addEventListener("click", previewBulkReplace);
   $("bulkApplyButton").addEventListener("click", applyBulkReplace);
+  $("textColorInput").addEventListener("input", (event) => {
+    setTextColor(event.target.value);
+  });
+  $("textColorHexInput").addEventListener("input", (event) => {
+    const color = normalizeColorHex(event.target.value);
+    if (color) {
+      $("textColorInput").value = color.toLowerCase();
+      markActiveColorSwatch(color);
+    }
+  });
+  $("textColorHexInput").addEventListener("change", (event) => {
+    if (!setTextColor(event.target.value)) {
+      showToast("请输入 6 位十六进制颜色，例如 #F8C200。", true);
+    }
+  });
+  document.querySelectorAll(".color-swatch").forEach((button) => {
+    button.addEventListener("click", () => setTextColor(button.dataset.color));
+  });
+  $("applyTextColorButton").addEventListener("click", applyTextColor);
+  $("removeTextColorButton").addEventListener("click", removeTextColor);
   $("exportButton").addEventListener("click", () => {
     window.open("/api/export-overrides", "_blank");
   });
@@ -645,6 +828,7 @@ function initEvents() {
     $(id).addEventListener("input", invalidateBulkPreview);
     $(id).addEventListener("change", invalidateBulkPreview);
   }
+  setTextColor($("textColorHexInput").value);
 }
 
 async function boot() {
